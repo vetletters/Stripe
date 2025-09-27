@@ -2,6 +2,8 @@
 import express, { Request, Response, NextFunction } from "express";
 import Stripe from "stripe";
 import https from "https";
+import * as dns from "node:dns/promises";
+import { URL } from "node:url";
 
 /* ============================ Config & Setup ============================ */
 
@@ -11,11 +13,22 @@ const PORT: number = Number(process.env.PORT || 3000);
 const STRIPE_SECRET_KEY: string | undefined = process.env.STRIPE_SECRET_KEY;
 if (!STRIPE_SECRET_KEY) throw new Error("Missing STRIPE_SECRET_KEY");
 
-// Force IPv4 + keep-alive; add retries & timeout to reduce transient network issues
-const agent = new https.Agent({ keepAlive: true, family: 4 });
+// TLS/HTTP client tuning (helps avoid transient network issues on some hosts)
+const agent = new https.Agent({
+  keepAlive: true,
+  family: 4, // prefer IPv4
+  // uncomment to force TLS 1.2 if your platform has TLS handshake quirks
+  // secureProtocol: "TLSv1_2_method",
+});
+// Choose Node or Fetch HTTP client (toggle by env if needed)
+const httpClient =
+  process.env.STRIPE_HTTP_CLIENT === "fetch"
+    ? Stripe.createFetchHttpClient()
+    : Stripe.createNodeHttpClient(agent);
+
 const stripe = new Stripe(STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
-  httpClient: Stripe.createNodeHttpClient(agent),
+  httpClient,
   maxNetworkRetries: 2,
   timeout: 30000,
 });
@@ -66,7 +79,7 @@ app.use((req: Request, res: Response, next: NextFunction): void => {
 });
 
 /* ============================ Stripe Webhook ============================ */
-/** Must be BEFORE any JSON middleware. */
+// MUST be before any JSON middleware.
 app.post(
   "/api/stripe-webhook",
   express.raw({ type: "application/json" }),
@@ -101,7 +114,8 @@ app.post(
 /* ============================ JSON for /api ============================= */
 app.use("/api", express.json());
 
-/* ============================ Stripe Diagnostics ============================ */
+/* ============================ Diagnostics =============================== */
+// Basic Stripe account reachability (uses your current STRIPE_SECRET_KEY)
 app.get("/api/diag/stripe", async (_req: Request, res: Response) => {
   try {
     const acct = await stripe.accounts.retrieve();
@@ -117,6 +131,53 @@ app.get("/api/diag/stripe", async (_req: Request, res: Response) => {
     });
   }
 });
+
+// Network probe: DNS + raw HTTPS to Stripe and Google (no auth)
+app.get("/api/diag/net", async (_req: Request, res: Response) => {
+  const results: any = { dns: {}, https: {} };
+  try {
+    results.dns.api_stripe = await dns.lookup("api.stripe.com", { all: true });
+  } catch (e: any) {
+    results.dns.api_stripe = { error: e?.message || String(e) };
+  }
+  try {
+    results.https.stripe = await rawHttpsGet("https://api.stripe.com/v1/charges", agent);
+  } catch (e: any) {
+    results.https.stripe = { error: e?.message || String(e) };
+  }
+  try {
+    results.https.google = await rawHttpsGet("https://www.google.com/generate_204", agent);
+  } catch (e: any) {
+    results.https.google = { error: e?.message || String(e) };
+  }
+  res.json(results);
+});
+
+async function rawHttpsGet(urlStr: string, ag: https.Agent): Promise<{ ok: boolean; status?: number; error?: string }> {
+  const url = new URL(urlStr);
+  return new Promise((resolve) => {
+    const req = https.request(
+      {
+        method: "GET",
+        protocol: url.protocol,
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        agent: ag,
+        timeout: 15000,
+      },
+      (resp) => {
+        // We expect 401 from Stripe when unauthenticated; that's still a successful TCP/TLS connection.
+        resolve({ ok: true, status: resp.statusCode ?? 0 });
+        resp.resume(); // drain
+      }
+    );
+    req.on("error", (err) => resolve({ ok: false, error: err.message }));
+    req.on("timeout", () => {
+      req.destroy(new Error("timeout"));
+    });
+    req.end();
+  });
+}
 
 /* ====================== Create PaymentIntent API ======================= */
 /**
@@ -361,19 +422,16 @@ async function addZohoNote(
   title: string,
   content: string
 ): Promise<void> {
-  await zohoReq(
-    accessToken,
-    "POST",
-    "/crm/v3/Notes",
-    {
-      data: [{
+  await zohoReq(accessToken, "POST", "/crm/v3/Notes", {
+    data: [
+      {
         Note_Title: title,
         Note_Content: content,
         Parent_Id: leadId,
         se_module: "Leads",
-      }]
-    }
-  );
+      },
+    ],
+  });
 }
 
 async function upsertZohoLead(
