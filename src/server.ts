@@ -1,5 +1,7 @@
+// src/server.ts
 import express, { Request, Response, NextFunction } from "express";
 import Stripe from "stripe";
+import https from "https";
 
 /* ============================ Config & Setup ============================ */
 
@@ -8,7 +10,15 @@ const PORT: number = Number(process.env.PORT || 3000);
 // Stripe (required)
 const STRIPE_SECRET_KEY: string | undefined = process.env.STRIPE_SECRET_KEY;
 if (!STRIPE_SECRET_KEY) throw new Error("Missing STRIPE_SECRET_KEY");
-const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
+
+// Force IPv4 + keep-alive; add retries & timeout to reduce transient network issues
+const agent = new https.Agent({ keepAlive: true, family: 4 });
+const stripe = new Stripe(STRIPE_SECRET_KEY, {
+  apiVersion: "2024-06-20",
+  httpClient: Stripe.createNodeHttpClient(agent),
+  maxNetworkRetries: 2,
+  timeout: 30000,
+});
 const STRIPE_WEBHOOK_SECRET: string | undefined = process.env.STRIPE_WEBHOOK_SECRET;
 
 // Zoho (optional; CRM is skipped if any are missing)
@@ -91,6 +101,23 @@ app.post(
 /* ============================ JSON for /api ============================= */
 app.use("/api", express.json());
 
+/* ============================ Stripe Diagnostics ============================ */
+app.get("/api/diag/stripe", async (_req: Request, res: Response) => {
+  try {
+    const acct = await stripe.accounts.retrieve();
+    res.json({ ok: true, account: acct.id });
+  } catch (e: any) {
+    res.status(500).json({
+      ok: false,
+      type: e?.type,
+      code: e?.code,
+      message: e?.message,
+      statusCode: e?.statusCode,
+      requestId: e?.requestId,
+    });
+  }
+});
+
 /* ====================== Create PaymentIntent API ======================= */
 /**
  * POST /api/create-payment-intent
@@ -141,10 +168,12 @@ app.post("/api/create-payment-intent", async (req: Request, res: Response): Prom
     });
 
     res.json({ clientSecret: pi.client_secret });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error("create-payment-intent error:", msg);
-    res.status(400).json({ error: msg || "Unable to create payment" });
+  } catch (err: any) {
+    console.error("create-payment-intent error:", err);
+    res.status(400).json({
+      error: err?.message || "Unable to create payment",
+      stripe: { type: err?.type, code: err?.code, requestId: err?.requestId },
+    });
   }
 });
 
@@ -185,7 +214,8 @@ async function onPaymentSucceeded(pi: Stripe.PaymentIntent): Promise<void> {
     if (!leadId || !HAS_ZOHO) return;
 
     const charge = await getLatestCharge(pi);
-    const method: string = (charge as unknown as { payment_method_details?: { type?: string } })?.payment_method_details?.type || "unknown";
+    const method: string =
+      (charge as unknown as { payment_method_details?: { type?: string } })?.payment_method_details?.type || "unknown";
     const amount: number = (pi.amount_received || pi.amount) / 100;
     const receipt: string = (charge as unknown as { receipt_url?: string })?.receipt_url || "";
     const product: string = pi.metadata?.product_name || "";
@@ -395,8 +425,8 @@ async function updateZohoLeadPaid(
     Order_Date: today,
     Product_Name: info.product_name,
   };
-  if (ZOHO_FIELD_AMOUNT) updates[ZOHO_FIELD_AMOUNT] = info.amount;
-  if (ZOHO_FIELD_PAYMENT_METHOD) updates[ZOHO_FIELD_PAYMENT_METHOD] = info.method;
+  if (ZOHO_FIELD_AMOUNT) (updates as any)[ZOHO_FIELD_AMOUNT] = info.amount;
+  if (ZOHO_FIELD_PAYMENT_METHOD) (updates as any)[ZOHO_FIELD_PAYMENT_METHOD] = info.method;
 
   await updateZohoLead(accessToken, leadId, updates);
 
