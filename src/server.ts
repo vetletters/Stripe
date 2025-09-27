@@ -1,98 +1,133 @@
-// server.js
-// Run on Render as a Web Service. Set env vars listed at the bottom.
-// Node 18+ (uses global fetch). If you're on older Node, add `npm i node-fetch` and import it.
+import express, { Request, Response, NextFunction } from "express";
+import Stripe from "stripe";
 
-const express = require('express');
-const Stripe = require('stripe');
+/* ============================ Config & Setup ============================ */
+
+const PORT: number = Number(process.env.PORT || 3000);
+
+// Stripe (required)
+const STRIPE_SECRET_KEY: string | undefined = process.env.STRIPE_SECRET_KEY;
+if (!STRIPE_SECRET_KEY) throw new Error("Missing STRIPE_SECRET_KEY");
+const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
+const STRIPE_WEBHOOK_SECRET: string | undefined = process.env.STRIPE_WEBHOOK_SECRET;
+
+// Zoho (optional; CRM is skipped if any are missing)
+const ZOHO_CLIENT_ID = process.env.ZOHO_CLIENT_ID;
+const ZOHO_CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
+const ZOHO_REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
+const ZOHO_API_BASE: string = process.env.ZOHO_API_BASE || "https://www.zohoapis.com";
+const ZOHO_ACCOUNTS_BASE: string = process.env.ZOHO_ACCOUNTS_BASE || "https://accounts.zoho.com";
+const ZOHO_FIELD_AMOUNT: string | undefined = process.env.ZOHO_FIELD_AMOUNT; // e.g. "Amount"
+const ZOHO_FIELD_PAYMENT_METHOD: string | undefined = process.env.ZOHO_FIELD_PAYMENT_METHOD; // e.g. "Payment_Method"
+const HAS_ZOHO: boolean = !!(ZOHO_CLIENT_ID && ZOHO_CLIENT_SECRET && ZOHO_REFRESH_TOKEN);
+
+type Lead = {
+  first_name?: string;
+  last_name?: string;
+  email: string;
+  phone?: string;
+  claim_type?: string;
+};
 
 const app = express();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
-/* ----------------------------- CORS (allowlist) ----------------------------- */
-const ALLOW = [
-  'https://www.vetletters.com',
-  'https://vetletters.com',
-  // Zoho Sites editor/runtime assets domain (wildcard match)
-  'https://zohositescontent.com',
-  'https://.zohositescontent.com'
+/* =============================== CORS =================================== */
+
+const ALLOW: string[] = [
+  "https://www.vetletters.com",
+  "https://vetletters.com",
+  ".zohositescontent.com", // suffix match for Zoho Sites assets
 ];
-// Lightweight CORS middleware (kept simple)
-app.use((req, res, next) => {
-  const origin = req.headers.origin || '';
-  const allowed = ALLOW.some(a =>
-    origin === a ||
-    (a.startsWith('https://.') && origin.endsWith(a.replace('https://.', '.'))) ||
-    (a === 'https://zohositescontent.com' && origin.endsWith('.zohositescontent.com'))
-  );
+
+app.use((req: Request, res: Response, next: NextFunction): void => {
+  const origin = String(req.headers.origin || "");
+  const allowed = ALLOW.some((a) => (a.startsWith(".") ? origin.endsWith(a) : origin === a));
   if (allowed) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
   }
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Stripe-Signature');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Stripe-Signature");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  if (req.method === "OPTIONS") {
+    res.sendStatus(200);
+    return;
+  }
   next();
 });
 
-/* --------------------------- Stripe Webhook (RAW) --------------------------- */
-/**
- * IMPORTANT: This route must use raw body, BEFORE any JSON parser.
- * Stripe requires the exact raw payload for signature verification.
- */
-app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  let event;
-  try {
-    const sig = req.headers['stripe-signature'];
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('❌ Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  try {
-    if (event.type === 'payment_intent.succeeded') {
-      const pi = event.data.object;
-      await handlePaymentSucceeded(pi);
+/* ============================ Stripe Webhook ============================ */
+/** Must be BEFORE any JSON middleware. */
+app.post(
+  "/api/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  async (req: Request, res: Response): Promise<void> => {
+    if (!STRIPE_WEBHOOK_SECRET) {
+      res.status(500).send("Webhook secret not set");
+      return;
     }
+    try {
+      const sig = String(req.headers["stripe-signature"] || "");
+      const event = stripe.webhooks.constructEvent(
+        (req as unknown as { body: Buffer }).body,
+        sig,
+        STRIPE_WEBHOOK_SECRET
+      );
 
-    if (event.type === 'payment_intent.payment_failed') {
-      const pi = event.data.object;
-      await handlePaymentFailed(pi);
+      if (event.type === "payment_intent.succeeded") {
+        await onPaymentSucceeded(event.data.object as Stripe.PaymentIntent);
+      } else if (event.type === "payment_intent.payment_failed") {
+        await onPaymentFailed(event.data.object as Stripe.PaymentIntent);
+      }
+
+      res.json({ received: true });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("Webhook error:", msg);
+      res.status(400).send(`Webhook Error: ${msg}`);
     }
-
-    res.json({ received: true });
-  } catch (err) {
-    console.error('❌ Webhook handling error:', err);
-    res.status(500).send('Server error');
   }
-});
+);
 
-/* ------------------- JSON parser for normal /api routes -------------------- */
-app.use('/api', express.json());
+/* ============================ JSON for /api ============================= */
+app.use("/api", express.json());
 
-/* ------------------- Create PaymentIntent (+ upsert CRM) ------------------- */
+/* ====================== Create PaymentIntent API ======================= */
 /**
- * Body:
- * {
- *   amount: 89900,            // cents
- *   currency: "usd",
- *   product: "VetLetters Standard",
- *   lead: { first_name, last_name, email, phone, claim_type }
- * }
+ * POST /api/create-payment-intent
+ * Body: { amount: number, currency?: 'usd', product?: string, lead: Lead }
  */
-app.post('/api/create-payment-intent', async (req, res) => {
+app.post("/api/create-payment-intent", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { amount, currency = 'usd', product = 'VetLetters', lead = {} } = req.body;
+    const {
+      amount,
+      currency = "usd",
+      product = "VetLetters",
+      lead = {},
+    }: {
+      amount?: number;
+      currency?: string;
+      product?: string;
+      lead?: Partial<Lead>;
+    } = (req.body ?? {}) as Record<string, unknown> as any;
 
     if (!amount || !lead?.email) {
-      return res.status(400).json({ error: 'Missing amount or lead.email' });
+      res.status(400).json({ error: "Missing amount or lead.email" });
+      return;
     }
 
-    // 1) Upsert Zoho Lead as Pending / with today Order_Date
-    const accessToken = await getZohoAccessToken();
-    const zohoLeadId = await upsertZohoLead(accessToken, lead, product, amount);
+    // Upsert Zoho lead (optional)
+    let zohoLeadId = "";
+    if (HAS_ZOHO) {
+      try {
+        const access = await getZohoAccessToken();
+        zohoLeadId = await upsertZohoLead(access, lead as Lead, product);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn("Zoho upsert skipped:", msg);
+      }
+    }
 
-    // 2) Create Stripe PaymentIntent (dynamic PMs => card, Klarna, Affirm if eligible)
+    // Create PI with dynamic methods (card/Klarna/Affirm when eligible)
     const pi = await stripe.paymentIntents.create({
       amount,
       currency,
@@ -100,216 +135,286 @@ app.post('/api/create-payment-intent', async (req, res) => {
       metadata: {
         zoho_lead_id: zohoLeadId,
         product_name: product,
-        source: 'vetletters_site'
+        source: "vetletters_site",
       },
-      receipt_email: lead.email
+      receipt_email: lead.email,
     });
 
-    return res.json({ clientSecret: pi.client_secret });
-  } catch (err) {
-    console.error('❌ create-payment-intent error:', err);
-    res.status(400).json({ error: err.message });
+    res.json({ clientSecret: pi.client_secret });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("create-payment-intent error:", msg);
+    res.status(400).json({ error: msg || "Unable to create payment" });
   }
 });
 
-/* ------------------------------- Healthcheck ------------------------------- */
-app.get('/', (_req, res) => {
-  res.type('text').send('VetLetters API OK');
+/* =============================== Healthcheck ============================== */
+app.get("/", (_req: Request, res: Response): void => {
+  res.type("text").send("VetLetters API OK");
 });
 
-/* =============================== Helpers =================================== */
-/* ----------------------------- Stripe helpers ------------------------------ */
-async function handlePaymentSucceeded(pi) {
+/* =========================== Stripe Helpers ============================== */
+
+async function getLatestCharge(pi: Stripe.PaymentIntent): Promise<Stripe.Charge | null> {
   try {
-    const leadId = pi?.metadata?.zoho_lead_id;
-    if (!leadId) return;
+    if (!pi.latest_charge) return null;
 
-    const charge = pi.charges?.data?.[0];
-    const method = charge?.payment_method_details?.type || 'unknown';
-    const amount = (pi.amount_received || pi.amount) / 100;
-    const receipt = charge?.receipt_url || '';
-    const product = pi?.metadata?.product_name || '';
+    if (typeof pi.latest_charge === "string") {
+      const ch = (await stripe.charges.retrieve(pi.latest_charge)) as unknown as Stripe.Charge;
+      return ch;
+    }
+    return pi.latest_charge as Stripe.Charge;
+  } catch {
+    try {
+      const full = await stripe.paymentIntents.retrieve(pi.id, { expand: ["latest_charge"] });
+      if (!full.latest_charge) return null;
+      if (typeof full.latest_charge === "string") {
+        const ch = (await stripe.charges.retrieve(full.latest_charge)) as unknown as Stripe.Charge;
+        return ch;
+      }
+      return full.latest_charge as Stripe.Charge;
+    } catch {
+      return null;
+    }
+  }
+}
 
-    const accessToken = await getZohoAccessToken();
-    await updateZohoLeadPaid(accessToken, leadId, {
+async function onPaymentSucceeded(pi: Stripe.PaymentIntent): Promise<void> {
+  try {
+    const leadId = pi.metadata?.zoho_lead_id;
+    if (!leadId || !HAS_ZOHO) return;
+
+    const charge = await getLatestCharge(pi);
+    const method: string = (charge as unknown as { payment_method_details?: { type?: string } })?.payment_method_details?.type || "unknown";
+    const amount: number = (pi.amount_received || pi.amount) / 100;
+    const receipt: string = (charge as unknown as { receipt_url?: string })?.receipt_url || "";
+    const product: string = pi.metadata?.product_name || "";
+
+    const access = await getZohoAccessToken();
+    await updateZohoLeadPaid(access, leadId, {
       product_name: product,
       amount,
       method,
-      receipt
+      receipt,
     });
-  } catch (err) {
-    console.error('❌ handlePaymentSucceeded error:', err);
+  } catch (e: unknown) {
+    console.error("onPaymentSucceeded error:", e instanceof Error ? e.message : String(e));
   }
 }
 
-async function handlePaymentFailed(pi) {
+async function onPaymentFailed(pi: Stripe.PaymentIntent): Promise<void> {
   try {
-    const leadId = pi?.metadata?.zoho_lead_id;
-    if (!leadId) return;
-    const accessToken = await getZohoAccessToken();
-    await markZohoLeadFailed(accessToken, leadId);
-  } catch (err) {
-    console.error('❌ handlePaymentFailed error:', err);
+    const leadId = pi.metadata?.zoho_lead_id;
+    if (!leadId || !HAS_ZOHO) return;
+    const access = await getZohoAccessToken();
+    await markZohoLeadFailed(access, leadId);
+  } catch (e: unknown) {
+    console.error("onPaymentFailed error:", e instanceof Error ? e.message : String(e));
   }
 }
 
-/* ------------------------------ Zoho helpers ------------------------------- */
-const ZOHO_ACCOUNTS = process.env.ZOHO_ACCOUNTS_BASE || 'https://accounts.zoho.com';
-const ZOHO_API_BASE = process.env.ZOHO_API_BASE || 'https://www.zohoapis.com';
+/* ============================= Zoho Helpers ============================== */
 
-/** Exchange refresh token -> access token */
-async function getZohoAccessToken() {
-  const url = `${ZOHO_ACCOUNTS}/oauth/v2/token` +
-              `?refresh_token=${encodeURIComponent(process.env.ZOHO_REFRESH_TOKEN)}` +
-              `&client_id=${encodeURIComponent(process.env.ZOHO_CLIENT_ID)}` +
-              `&client_secret=${encodeURIComponent(process.env.ZOHO_CLIENT_SECRET)}` +
-              `&grant_type=refresh_token`;
+async function getZohoAccessToken(): Promise<string> {
+  if (!HAS_ZOHO) throw new Error("Zoho credentials missing");
 
-  const r = await fetch(url, { method: 'POST' });
+  const params = new URLSearchParams();
+  params.set("refresh_token", ZOHO_REFRESH_TOKEN as string);
+  params.set("client_id", ZOHO_CLIENT_ID as string);
+  params.set("client_secret", ZOHO_CLIENT_SECRET as string);
+  params.set("grant_type", "refresh_token");
+
+  const r = await fetch(`${ZOHO_ACCOUNTS_BASE}/oauth/v2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+
   if (!r.ok) throw new Error(`Zoho token error ${r.status}`);
-  const j = await r.json();
-  if (!j.access_token) throw new Error('No Zoho access token');
+  const j = (await r.json()) as unknown as { access_token?: string };
+  if (!j.access_token) throw new Error("No Zoho access token");
   return j.access_token;
 }
 
-/** Basic Zoho request wrapper */
-async function zohoReq(accessToken, method, path, body) {
+async function zohoReq<T = unknown>(
+  accessToken: string,
+  method: "GET" | "POST" | "PUT",
+  path: string,
+  body?: unknown
+): Promise<T | null> {
   const r = await fetch(`${ZOHO_API_BASE}${path}`, {
     method,
     headers: {
       Authorization: `Zoho-oauthtoken ${accessToken}`,
-      'Content-Type': 'application/json'
+      "Content-Type": "application/json",
     },
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
   });
+
   if (r.status === 204) return null;
   const text = await r.text();
-  let data;
-  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!r.ok) {
-    const msg = data?.message || data?.data?.[0]?.message || `Zoho ${method} ${path} failed`;
-    throw new Error(msg);
+
+  let data: unknown;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
   }
-  return data;
+
+  if (!r.ok) {
+    const msg =
+      (data as any)?.message ||
+      (data as any)?.data?.[0]?.message ||
+      `Zoho ${method} ${path} failed (${r.status})`;
+    throw new Error(String(msg));
+  }
+  return data as T;
 }
 
-/** Search lead by email (tries dedicated email search, then criteria) */
-async function searchZohoLeadByEmail(accessToken, email) {
-  if (!email) return null;
-  // Try email search endpoint
+async function searchZohoLeadByEmail(accessToken: string, email: string): Promise<any | null> {
+  // Try direct email search
   try {
-    const r1 = await zohoReq(accessToken, 'GET', `/crm/v3/Leads/search?email=${encodeURIComponent(email)}`);
+    const r1 = await zohoReq<any>(
+      accessToken,
+      "GET",
+      `/crm/v3/Leads/search?email=${encodeURIComponent(email)}`
+    );
     if (r1?.data?.length) return r1.data[0];
-  } catch (_e) { /* fall back to criteria */ }
+  } catch {
+    // ignore; try criteria below
+  }
 
-  // Criteria fallback
   const criteria = encodeURIComponent(`(Email:equals:${email})`);
-  const r2 = await zohoReq(accessToken, 'GET', `/crm/v3/Leads/search?criteria=${criteria}`);
+  const r2 = await zohoReq<any>(
+    accessToken,
+    "GET",
+    `/crm/v3/Leads/search?criteria=${criteria}`
+  );
   return r2?.data?.[0] || null;
 }
 
-/** Update Zoho lead fields (ignore undefined) */
-async function updateZohoLead(accessToken, id, fields) {
-  const clean = {};
-  Object.entries(fields || {}).forEach(([k, v]) => {
-    if (typeof v !== 'undefined' && v !== null) clean[k] = v;
-  });
-  const payload = { data: [{ id, ...clean }] };
-  await zohoReq(accessToken, 'PUT', '/crm/v3/Leads', payload);
+async function updateZohoLead(
+  accessToken: string,
+  id: string,
+  fields: Record<string, unknown>
+): Promise<void> {
+  const clean: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (typeof v !== "undefined" && v !== null) clean[k] = v;
+  }
+  await zohoReq(
+    accessToken,
+    "PUT",
+    "/crm/v3/Leads",
+    { data: [{ id, ...clean }] }
+  );
 }
 
-/** Create lead */
-async function createZohoLead(accessToken, leadFields) {
-  const payload = { data: [leadFields] };
-  const resp = await zohoReq(accessToken, 'POST', '/crm/v3/Leads', payload);
-  const id = resp?.data?.[0]?.details?.id;
-  if (!id) throw new Error('Zoho create lead failed');
+async function createZohoLead(
+  accessToken: string,
+  leadFields: Record<string, unknown>
+): Promise<string> {
+  const resp = await zohoReq<any>(
+    accessToken,
+    "POST",
+    "/crm/v3/Leads",
+    { data: [leadFields] }
+  );
+  const id: string | undefined = resp?.data?.[0]?.details?.id;
+  if (!id) throw new Error("Zoho create lead failed");
   return id;
 }
 
-/** Add a Zoho Note on a Lead */
-async function addZohoNote(accessToken, leadId, title, content) {
-  const payload = {
-    data: [{
-      Note_Title: title,
-      Note_Content: content,
-      Parent_Id: leadId,
-      se_module: 'Leads'
-    }]
-  };
-  await zohoReq(accessToken, 'POST', '/crm/v3/Notes', payload);
+async function addZohoNote(
+  accessToken: string,
+  leadId: string,
+  title: string,
+  content: string
+): Promise<void> {
+  await zohoReq(
+    accessToken,
+    "POST",
+    "/crm/v3/Notes",
+    {
+      data: [{
+        Note_Title: title,
+        Note_Content: content,
+        Parent_Id: leadId,
+        se_module: "Leads",
+      }]
+    }
+  );
 }
 
-/** Upsert lead by email; set Pending + today date + basic fields */
-async function upsertZohoLead(accessToken, lead, product, amountCents) {
+async function upsertZohoLead(
+  accessToken: string,
+  lead: Lead,
+  product: string
+): Promise<string> {
   const today = new Date().toISOString().slice(0, 10);
-
   const existing = await searchZohoLeadByEmail(accessToken, lead.email);
+
   const baseFields = {
     Product_Name: product,
-    Order_Status: 'Pending',
-    Order_Date: today
+    Order_Status: "Pending",
+    Order_Date: today,
   };
+  const desc = lead.claim_type ? `Claim Type: ${lead.claim_type}` : "";
 
-  const desc = lead.claim_type ? `Claim Type: ${lead.claim_type}` : '';
   if (existing?.id) {
     await updateZohoLead(accessToken, existing.id, {
       ...baseFields,
-      Description: desc || existing.Description || ''
+      Description: desc || existing.Description || "",
     });
-    return existing.id;
+    return String(existing.id);
   }
 
   // Zoho Leads often require Company + Last_Name
-  const createFields = {
-    Company: 'VetLetters',
-    Last_Name: lead.last_name || lead.email || 'Unknown',
-    First_Name: lead.first_name || '',
+  const fields = {
+    Company: "VetLetters",
+    Last_Name: lead.last_name || lead.email || "Unknown",
+    First_Name: lead.first_name || "",
     Email: lead.email,
-    Phone: lead.phone || '',
+    Phone: lead.phone || "",
     Description: desc,
-    ...baseFields
+    ...baseFields,
   };
-  const id = await createZohoLead(accessToken, createFields);
-  return id;
+
+  return await createZohoLead(accessToken, fields);
 }
 
-/** Mark Paid and add Note; optionally write custom fields if present */
-async function updateZohoLeadPaid(accessToken, leadId, info) {
+async function updateZohoLeadPaid(
+  accessToken: string,
+  leadId: string,
+  info: { product_name: string; amount: number; method: string; receipt: string }
+): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
 
-  // Base updates (safe, known fields)
-  const updates = {
-    Order_Status: 'Paid',
+  const updates: Record<string, unknown> = {
+    Order_Status: "Paid",
     Order_Date: today,
-    Product_Name: info.product_name
+    Product_Name: info.product_name,
   };
-
-  // If you created custom fields in Zoho, set their API names here:
-  // e.g., ZOHO_FIELD_AMOUNT="Amount", ZOHO_FIELD_PAYMENT_METHOD="Payment_Method"
-  if (process.env.ZOHO_FIELD_AMOUNT) {
-    updates[process.env.ZOHO_FIELD_AMOUNT] = info.amount;
-  }
-  if (process.env.ZOHO_FIELD_PAYMENT_METHOD) {
-    updates[process.env.ZOHO_FIELD_PAYMENT_METHOD] = info.method;
-  }
+  if (ZOHO_FIELD_AMOUNT) updates[ZOHO_FIELD_AMOUNT] = info.amount;
+  if (ZOHO_FIELD_PAYMENT_METHOD) updates[ZOHO_FIELD_PAYMENT_METHOD] = info.method;
 
   await updateZohoLead(accessToken, leadId, updates);
 
-  const note = `Payment received.
-Method: ${info.method}
-Amount: $${info.amount}
-Receipt: ${info.receipt || 'N/A'}`;
-  await addZohoNote(accessToken, leadId, 'Stripe Payment', note);
+  const note =
+    `Payment received.\n` +
+    `Method: ${info.method}\n` +
+    `Amount: $${info.amount}\n` +
+    `Receipt: ${info.receipt || "N/A"}`;
+
+  await addZohoNote(accessToken, leadId, "Stripe Payment", note);
 }
 
-/** Mark Failed */
-async function markZohoLeadFailed(accessToken, leadId) {
-  await updateZohoLead(accessToken, leadId, { Order_Status: 'Failed' });
+async function markZohoLeadFailed(accessToken: string, leadId: string): Promise<void> {
+  await updateZohoLead(accessToken, leadId, { Order_Status: "Failed" });
 }
 
-/* ------------------------------ Start server ------------------------------- */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+/* ================================ Start =================================== */
+
+app.listen(PORT, (): void => {
   console.log(`✅ VetLetters API listening on :${PORT}`);
 });
